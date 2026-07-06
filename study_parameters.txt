@@ -1,0 +1,145 @@
+================================================================================
+STUDY PARAMETERS & DEFINITIONS  —  reference for the final report / methods section
+Zero-shot sensing-radius generalization in InforMARL across team sizes
+(compiled 2026-07-05; values taken from the Mava rec_mappo config actually used)
+================================================================================
+
+--------------------------------------------------------------------------------
+1. STUDY DESIGN
+--------------------------------------------------------------------------------
+Research question : How well does an InforMARL policy trained at one sensing
+                    radius generalize (zero-shot) to other sensing radii, and how
+                    does that generalization change with team size?
+Team sizes (N)    : 6, 9, 12   (agents = landmarks = N)
+Train radii (rho) : 0.3, 0.7, 1.2   (sensing/visibility radius during training)
+Test radii        : 0.3, 0.7, 1.2   (zero-shot at eval, no retraining)
+Seeds             : 3  (seeds 0, 1, 2), trained sequentially (independent inits)
+Training runs     : 3 teams x 3 train-radii x 3 seeds = 27
+Evaluations       : each trained model evaluated at all 3 test radii + a random
+                    (untrained) baseline per team.
+Hypotheses        : H1 generalization degrades with radius-shift magnitude;
+                    H2 degradation is asymmetric with shift direction;
+                    H3 degradation is larger for larger teams.
+
+--------------------------------------------------------------------------------
+2. ENVIRONMENT
+--------------------------------------------------------------------------------
+Env               : JaxMARL MPE "simple_spread" (name: MPE_simple_spread_v3)
+                    (JaxMARL fork: RuanJohn/JaxMARL, via Mava)
+num_agents        : N ;  num_landmarks : N
+local_ratio       : 0.5   (reward = 0.5*global + 0.5*local)
+Episode length    : 25 steps (env max_steps=25; matches original InforMARL
+                    onpolicy/scripts/train_mpe.sh --episode_length 25)
+World              : 2 x 2 continuous ([-1, +1]^2); agents AND landmarks spawned
+                    uniform at random in [-1,+1]^2 each episode
+Agent radius       : 0.15 ;  Landmark radius : 0.05
+Action type        : Continuous
+Reward             : penalty-based (always <= 0). Global term = -sum over landmarks
+                    of (distance from that landmark to its nearest agent); plus a
+                    per-agent local term; combined via local_ratio. No positive
+                    reward; a perfect policy approaches (but never reaches) 0.
+Sensing radius     : "visibility_radius" — an agent's InforMARL ego-graph only
+                    includes entities within this Euclidean distance. THE study
+                    independent variable.
+
+--------------------------------------------------------------------------------
+3. ALGORITHM / MODEL
+--------------------------------------------------------------------------------
+Method            : InforMARL = recurrent MAPPO (RMAPPO) on a graph observation
+Framework         : Mava (InstaDeep), Anakin (single-GPU) architecture; network=rnn_graph
+Actor pre-torso   : InforMARLNbrhdAggregationTorso  (neighborhood GNN + attention)
+Critic pre-torso  : InforMARLGlobalAggregationTorso (global GNN + attention)
+  attention_query_layer_sizes : [128]
+  num_heads                   : 4
+  num_attention_layers        : 1
+  activation                  : relu ;  use_layer_norm : False
+Post-torso (actor & critic)   : MLP, layer_sizes [128], relu, no layer norm
+Recurrent core    : ScannedRNN (GRU-style), hidden_state_dim = 128
+add_agent_id      : True (1)
+
+--------------------------------------------------------------------------------
+4. TRAINING HYPERPARAMETERS  (Mava rec_mappo defaults; unchanged)
+--------------------------------------------------------------------------------
+num_envs (parallel)      : 8
+update_batch_size        : 1   (sequential seeds; one independent run per seed)
+rollout_length           : 128     (one PPO update per 8*128 = 1024 env steps)
+num_updates_per_eval     : 10      ("eval window" -> log/eval every ~10,240 steps)
+num_evaluation           : 200     (=> num_updates = 2000)
+Total steps per run      : num_updates * num_envs * rollout_length * update_batch_size
+                           = 2000 * 8 * 128 * 1 = 2,048,000  (~2.05M) per run
+ppo_epochs               : 4
+num_minibatches          : 2
+actor_lr = critic_lr     : 0.00025
+decay_learning_rates     : False
+gamma (discount)         : 0.99
+gae_lambda               : 0.95
+clip_eps (PPO clip)      : 0.2
+ent_coef                 : 0.01
+vf_coef                  : 0.5
+max_grad_norm            : 0.5
+recurrent_chunk_size     : 128
+optimizer                : Adam (eps 1e-5) with global-norm clipping
+Checkpoints              : saved every 200,000 steps + a final checkpoint per run
+Step-0 baseline          : untrained policy evaluated before training (curve start)
+
+--------------------------------------------------------------------------------
+5. EVALUATION (hand-written rollout; validated against the N=6/1.2 model)
+--------------------------------------------------------------------------------
+Episodes per (model, test-radius) : 150 (parallel, greedy? -> actions SAMPLED:
+                                    evaluation_greedy = False)
+Metrics reported:
+  reward           : mean episode return = sum over the 25 steps of the per-step
+                     reward, averaged over agents, then averaged over episodes.
+  collision_rate   : mean number of agent-agent "collision-steps" per episode. A
+                     pair collides on a step if their centers are within
+                     collision_dist = 0.30 (= 2 x agent_radius). Counted each step,
+                     summed over the episode, averaged over episodes.
+  goal_completion  : mean fraction of landmarks "covered" at the FINAL step of the
+                     episode. A landmark is covered if its nearest agent is within
+                     goal_dist = 0.20 (= agent_radius 0.15 + landmark_radius 0.05),
+                     i.e. the agent physically overlaps the landmark.
+  mean_landmark_dist: mean final-step distance from each landmark to its nearest agent.
+Random baseline   : identical eval on a freshly-initialized (untrained) network.
+Note              : reward, collisions, goals are recomputed at eval time from the
+                    saved models, so thresholds (0.30, 0.20) can be revised without
+                    retraining.
+
+--------------------------------------------------------------------------------
+6. PRE-STUDY: NEIGHBOR-CONNECTIVITY ANALYSIS (justifies the radius choices)
+--------------------------------------------------------------------------------
+Avg agent-neighbors per agent (2x2 world, uniform spawn, 20k samples):
+   radius    N=6     N=9     N=12      regime
+   0.3       0.30    0.50    0.68      sparse
+   0.7       1.38    2.22    3.05      moderate
+   1.2       3.11    4.96    6.80      dense
+Verified to match the original InforMARL environment geometry (same 2x2 world,
+uniform spawn, Euclidean edge rule).
+
+--------------------------------------------------------------------------------
+7. COMPUTE
+--------------------------------------------------------------------------------
+Library versions  : JAX + jaxlib (CUDA 12) via `uv sync --extra cuda12` (Mava lock)
+Hardware split    : RTX 3090 (24 GB) -> N=6 ; A100 (80 GB) -> N=9, N=12
+                    (N=12 at 1 seed exceeds 24 GB, hence the A100)
+JAX settings      : XLA_PYTHON_CLIENT_PREALLOCATE=false; persistent compilation cache
+Reproducibility   : one XLA compile per (team-size x radius); seeds share the compile.
+
+--------------------------------------------------------------------------------
+8. PRELIMINARY FINDINGS (to verify/expand with full results)
+--------------------------------------------------------------------------------
+- N=6 / radius 1.2: reward converges to ~ -30 to -32 by ~250k steps; random ~ -41.
+- N=6 is radius-INSENSITIVE in reward (~-30.8 at all test radii) but radius-SENSITIVE
+  in collisions (collision-steps 6.6 -> 7.8 -> 14.1 as radius 1.2 -> 0.7 -> 0.3), and
+  coverage rises slightly at small radius. => the coordination effect shows in
+  collisions/coverage, not reward; multi-metric evaluation is necessary.
+- Expectation (H3): the effect strengthens for larger teams (N=9, N=12).
+
+--------------------------------------------------------------------------------
+9. DATA / OUTPUT FILES
+--------------------------------------------------------------------------------
+Per pod (3090, a100): <pod>_cache.zip (compiles), <pod>_train_results.zip
+  (models/<team>_<radius>_<seed>/params_<step>.msgpack + curves/<team>_<radius>_<seed>.json),
+  <pod>_eval_results.csv (team, train_radius, seed, test_radius, is_random,
+  reward, collision_rate, goal_completion, mean_landmark_dist).
+Analysis: done locally from the two eval CSVs + convergence JSONs (no JAX needed).
+================================================================================
